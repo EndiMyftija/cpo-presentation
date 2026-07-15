@@ -57,7 +57,8 @@ The asynchronous pipeline consists of:
 
 1. Reserving a seat for the customer.
 2. If reservation was successful, then contact payment.
-3. If payment fails, then perform compensating action of releasing the seat via a Kafka message.
+3. If payment reaches a terminal failure, or if OrderService knows PaymentService was never reached at all, then fail the order and write a `RESERVATION_RELEASE_REQUESTED` event to the Orders outbox in the same transaction.
+4. Debezium publishes that committed outbox row to Kafka, and ReservationService performs the compensating seat release idempotently.
 
 ---
 
@@ -140,20 +141,23 @@ sequenceDiagram
     Notification->>Notification: Store and send confirmation email
 ```
 
-#### Payment Declined and Seat Release
+#### Payment Failure and Seat Release
 
-The system reserves before charging. If the charge is declined, OrderService does not leave the seat locked; it requests an asynchronous release, and ReservationService emits a release event so CatalogService can update its read model.
+The system reserves before charging. If payment has a known terminal failure, for example a card decline, OrderService does not leave the seat locked. It marks the order as `FAILED` and writes a `RESERVATION_RELEASE_REQUESTED` event to the Orders outbox in the same local database transaction.
+
+This is the important fix compared with the earlier design: the order failure and the release request are no longer two independent writes. OrderService still does not run a distributed transaction with ReservationService, but its own state transition and its outgoing release request are now atomic. Debezium then publishes the release request after commit, and ReservationService performs the actual release in its own transaction.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Order as OrderService
+    participant OrdersDB as orders-db
     participant Reservation as ReservationService
     participant ReservationDB as reservation-db
     participant Payment as PaymentService
     participant Stripe
+    participant Debezium as Debezium
     participant Kafka as Kafka reservation-release-requests
-    participant Debezium
     participant ReservationEvents as Kafka reservation-events
     participant Catalog as CatalogService
     participant CatalogDB as catalog-db
@@ -168,9 +172,11 @@ sequenceDiagram
     Stripe-->>Payment: Declined
     Payment-->>Order: DECLINED
 
-    Order->>Kafka: Publish release request
-    Order->>Order: Mark order FAILED
-    Kafka->>Reservation: Deliver release request
+    Order->>OrdersDB: Update order FAILED + insert RESERVATION_RELEASE_REQUESTED outbox row
+    OrdersDB-->>Order: Commit
+    Debezium->>OrdersDB: Read committed outbox row from WAL
+    Debezium->>Kafka: Publish RESERVATION_RELEASE_REQUESTED
+    Kafka->>Reservation: Deliver release request at least once
     Reservation->>ReservationDB: Mark reservation released + restore seats + outbox
     ReservationDB-->>Reservation: Commit
     Debezium->>ReservationEvents: Publish RESERVATION_RELEASED
@@ -178,14 +184,45 @@ sequenceDiagram
     Catalog->>CatalogDB: Inbox dedupe + increment projected availability
 ```
 
-#### Uncertain Payment Outcome Recovery
+#### PaymentService Definitely Not Reached
 
-If PaymentService becomes unreachable after the card may have been charged, OrderService does not release the seat immediately. It moves the order into `PAYMENT_PENDING_VERIFICATION` and waits for the durable payment event or recovery scheduler.
+Seat release is also safe when OrderService knows the payment request never reached PaymentService, for example because it could not even establish a TCP connection to PaymentService. In that case there is no `PENDING` payment row, no Stripe call to recover, and no future `PAYMENT_PROCESSED` event to wait for. Holding the reservation would leak seats forever, so OrderService fails the order and emits the release request through the same outbox path.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Order as OrderService
+    participant OrdersDB as orders-db
+    participant Reservation as ReservationService
+    participant ReservationDB as reservation-db
+    participant Payment as PaymentService
+    participant Debezium as Debezium
+    participant Kafka as Kafka reservation-release-requests
+
+    Order->>Reservation: Reserve seats for orderId
+    Reservation->>ReservationDB: Atomic reservation + inventory decrement
+    ReservationDB-->>Reservation: Commit
+    Reservation-->>Order: RESERVED
+
+    Order-xPayment: TCP connection cannot be established
+    Order->>OrdersDB: Update order FAILED + insert RESERVATION_RELEASE_REQUESTED outbox row
+    OrdersDB-->>Order: Commit
+    Debezium->>OrdersDB: Read committed outbox row from WAL
+    Debezium->>Kafka: Publish RESERVATION_RELEASE_REQUESTED
+    Kafka->>Reservation: Deliver release request
+    Reservation->>ReservationDB: Idempotently release reservation + restore seats + outbox
+    ReservationDB-->>Reservation: Commit
+```
+
+#### Uncertain Payment Outcome Recovery
+
+If PaymentService becomes unreachable after it may have received the request, the outcome is unknown: PaymentService may already have created a `PENDING` payment row, may have called Stripe, or may crash before returning to OrderService. In this case OrderService must not release the seat immediately. It moves the order into `PAYMENT_PENDING_VERIFICATION`, keeps the reservation held, and waits for the durable payment event or recovery scheduler.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Order as OrderService
+    participant OrdersDB as orders-db
     participant Reservation as ReservationService
     participant Payment as PaymentService
     participant PaymentDB as payments-db
@@ -193,6 +230,7 @@ sequenceDiagram
     participant Recovery as PaymentRecoveryScheduler
     participant Debezium
     participant Kafka as Kafka payment-events
+    participant ReleaseKafka as Kafka reservation-release-requests
 
     Order->>Reservation: Reserve seats
     Reservation-->>Order: RESERVED
@@ -209,7 +247,12 @@ sequenceDiagram
     Recovery->>PaymentDB: Update payment + insert PAYMENT_PROCESSED outbox row
     Debezium->>Kafka: Publish PAYMENT_PROCESSED
     Kafka->>Order: Deliver payment event
-    Order->>Order: Confirm if COMPLETED, otherwise fail and release reservation
+    alt payment COMPLETED
+        Order->>OrdersDB: Mark order CONFIRMED + insert ORDER_CONFIRMED outbox row
+    else payment DECLINED or FAILED
+        Order->>OrdersDB: Mark FAILED + insert RESERVATION_RELEASE_REQUESTED outbox row
+        Debezium->>ReleaseKafka: Publish RESERVATION_RELEASE_REQUESTED
+    end
 ```
 
 ---
